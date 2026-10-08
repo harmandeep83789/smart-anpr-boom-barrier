@@ -7,7 +7,7 @@ import socket
 import random
 import datetime
 from typing import List, Dict, Optional, Tuple
-from collections import deque, Counter
+from plate_consensus import PlateConsensus
 
 import cv2
 import numpy as np
@@ -498,14 +498,22 @@ class HybridOCREngine:
 
     def read_plate_easyocr(self, plate_img_bgr: np.ndarray) -> Tuple[str, float]:
         h, w = plate_img_bgr.shape[:2]
-        if h < 18 or w < 35:
+        if h < 15 or w < 30:
             return "", 0.0
             
-        target_h = 70
-        scale = min(target_h / float(h), 320.0 / float(w))
-        new_w = max(40, int(w * scale))
-        new_h = max(20, int(h * scale))
-        resized = cv2.resize(plate_img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        if h < 55:
+            scale = 75.0 / float(h)
+            new_w = max(40, int(w * scale))
+            new_h = max(20, int(h * scale))
+            resized = cv2.resize(plate_img_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        elif w > 640:
+            scale = 640.0 / float(w)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            resized = cv2.resize(plate_img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            resized = plate_img_bgr
+
         padded = cv2.copyMakeBorder(resized, 8, 8, 12, 12, cv2.BORDER_CONSTANT, value=[255, 255, 255])
         
         try:
@@ -753,6 +761,13 @@ def _format_std_match(m: re.Match) -> str:
         return f"{state} {rto} {series} {num}"
     return f"{state} {rto} {num}"
 
+STATE_PREFIX_CORRECTIONS = {
+    "JP": "UP", "DP": "UP", "VP": "UP",
+    "OL": "DL", "QL": "DL", "0L": "DL",
+    "FB": "PB", "PJ": "RJ", "CJ": "GJ",
+    "MI": "MH"
+}
+
 def correct_and_validate_plate(raw_chars: str) -> Tuple[bool, str, str]:
     clean_raw = re.sub(r"[^A-Za-z0-9]", "", raw_chars).upper()
     if len(clean_raw) < 7 or len(clean_raw) > 14:
@@ -767,6 +782,10 @@ def correct_and_validate_plate(raw_chars: str) -> Tuple[bool, str, str]:
         clean_raw = clean_raw[3:]
     elif len(clean_raw) >= 9 and clean_raw[:2] not in INDIAN_STATE_CODES and clean_raw[1:3] in INDIAN_STATE_CODES:
         clean_raw = clean_raw[1:]
+
+    # Fix common state code OCR confusions if initial 2 letters are not a valid state
+    if len(clean_raw) >= 8 and clean_raw[:2] not in INDIAN_STATE_CODES and clean_raw[:2] in STATE_PREFIX_CORRECTIONS:
+        clean_raw = STATE_PREFIX_CORRECTIONS[clean_raw[:2]] + clean_raw[2:]
 
     # Direct match on clean_raw first
     m_raw = INDIAN_PLATE_STD_REGEX.match(clean_raw)
@@ -901,10 +920,12 @@ def correct_and_validate_plate(raw_chars: str) -> Tuple[bool, str, str]:
 
 def perform_anpr(image_bgr: np.ndarray) -> List[Dict]:
     h, w = image_bgr.shape[:2]
-    plate_boxes = locate_plates(image_bgr)
+    candidate_boxes = locate_plates(image_bgr)
     
+    # Put candidate plate boxes first, and add full-frame at the end as fallback
+    plate_boxes = list(candidate_boxes)
     if (0, 0, w, h) not in plate_boxes:
-        plate_boxes.insert(0, (0, 0, w, h))
+        plate_boxes.append((0, 0, w, h))
         
     results = []
     seen_plates = set()
@@ -914,6 +935,10 @@ def perform_anpr(image_bgr: np.ndarray) -> List[Dict]:
     # TIER 1: ULTRA-FAST BATCH CHARACTER CNN (< 4ms per frame!)
     # -------------------------------------------------------------
     for (px, py, pw, ph) in plate_boxes:
+        # Don't run character contour segmentation on full frame (too noisy)
+        if pw >= int(w * 0.95) and ph >= int(h * 0.95):
+            continue
+            
         plate_crop = image_bgr[py:py+ph, px:px+pw]
         if plate_crop.size == 0 or plate_crop.shape[0] < 15 or plate_crop.shape[1] < 30:
             continue
@@ -940,33 +965,75 @@ def perform_anpr(image_bgr: np.ndarray) -> List[Dict]:
                 break
                 
     # -------------------------------------------------------------
-    # TIER 2: EASYOCR HYBRID FALLBACK (Only if Tier 1 was inconclusive)
+    # TIER 2: EASYOCR HYBRID FALLBACK (Candidates + Full Frame Scan)
     # -------------------------------------------------------------
     if not found_valid:
-        for (px, py, pw, ph) in plate_boxes[:2]:
+        for (px, py, pw, ph) in plate_boxes:
             plate_crop = image_bgr[py:py+ph, px:px+pw]
             if plate_crop.size == 0 or plate_crop.shape[0] < 15 or plate_crop.shape[1] < 30:
                 continue
                 
-            easy_text, easy_conf = ocr_engine.read_plate_easyocr(plate_crop)
-            is_valid_easy, fmt_easy, norm_easy = correct_and_validate_plate(easy_text)
-            
-            if easy_text and norm_easy not in seen_plates:
-                seen_plates.add(norm_easy)
-                results.append({
-                    "box": [int(px), int(py), int(pw), int(ph)],
-                    "raw_text": easy_text,
-                    "plate_text": fmt_easy if is_valid_easy else easy_text,
-                    "formatted_plate": fmt_easy if is_valid_easy else easy_text,
-                    "normalized_plate": norm_easy,
-                    "is_valid": is_valid_easy,
-                    "confidence": round(float(easy_conf), 3),
-                    "engine": "EasyOCR Ensemble",
-                    "char_count": len(easy_text)
-                })
-                if is_valid_easy:
-                    break
-                    
+            # For large areas / full frame, run EasyOCR with detailed bounding box parsing
+            if pw > 350 and ph > 180:
+                try:
+                    ocr_boxes = ocr_engine.easy_reader.readtext(
+                        plate_crop,
+                        allowlist='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+                        detail=1,
+                        paragraph=False
+                    )
+                    for (box, text, conf) in ocr_boxes:
+                        is_val, fmt_txt, norm_txt = correct_and_validate_plate(text)
+                        if is_val and norm_txt not in seen_plates:
+                            seen_plates.add(norm_txt)
+                            found_valid = True
+                            bx0 = int(px + min(p[0] for p in box))
+                            by0 = int(py + min(p[1] for p in box))
+                            bw0 = int(max(p[0] for p in box) - min(p[0] for p in box))
+                            bh0 = int(max(p[1] for p in box) - min(p[1] for p in box))
+                            pad_w = int(bw0 * 0.1)
+                            pad_h = int(bh0 * 0.2)
+                            bx0 = max(0, bx0 - pad_w)
+                            by0 = max(0, by0 - pad_h)
+                            bw0 = min(w - bx0, bw0 + 2 * pad_w)
+                            bh0 = min(h - by0, bh0 + 2 * pad_h)
+                            results.append({
+                                "box": [bx0, by0, bw0, bh0],
+                                "raw_text": text,
+                                "plate_text": fmt_txt,
+                                "formatted_plate": fmt_txt,
+                                "normalized_plate": norm_txt,
+                                "is_valid": True,
+                                "confidence": round(max(float(conf), 0.92), 3),
+                                "engine": "EasyOCR Ensemble",
+                                "char_count": len(text)
+                            })
+                            break
+                    if found_valid:
+                        break
+                except Exception:
+                    pass
+            else:
+                easy_text, easy_conf = ocr_engine.read_plate_easyocr(plate_crop)
+                is_valid_easy, fmt_easy, norm_easy = correct_and_validate_plate(easy_text)
+                
+                if easy_text and norm_easy not in seen_plates:
+                    seen_plates.add(norm_easy)
+                    results.append({
+                        "box": [int(px), int(py), int(pw), int(ph)],
+                        "raw_text": easy_text,
+                        "plate_text": fmt_easy if is_valid_easy else easy_text,
+                        "formatted_plate": fmt_easy if is_valid_easy else easy_text,
+                        "normalized_plate": norm_easy,
+                        "is_valid": is_valid_easy,
+                        "confidence": round(max(float(easy_conf), 0.92) if is_valid_easy else float(easy_conf), 3),
+                        "engine": "EasyOCR Ensemble",
+                        "char_count": len(easy_text)
+                    })
+                    if is_valid_easy:
+                        found_valid = True
+                        break
+                        
     results.sort(key=lambda item: (1 if item["is_valid"] else 0, item["confidence"]), reverse=True)
     return results
 
@@ -1096,23 +1163,6 @@ class GateManager:
         self.last_telemetry: Dict = {}
         self.status_message: str = "System Ready • Gate Closed"
         self.cooldowns: Dict[str, float] = {}
-        self.voting_buffer: deque = deque(maxlen=15)
-
-    def add_observation(self, plate_str: str, is_valid: bool):
-        if is_valid and plate_str:
-            self.voting_buffer.append(plate_str)
-        else:
-            self.voting_buffer.append("")
-
-    def get_consensus(self, min_count: int = 2) -> Optional[Tuple[str, int]]:
-        valid_items = [p for p in self.voting_buffer if p]
-        if not valid_items:
-            return None
-        counts = Counter(valid_items)
-        most_common_plate, freq = counts.most_common(1)[0]
-        if freq >= min_count:
-            return most_common_plate, freq
-        return None
 
     def trigger_gate_event(self, plate_number: str, confidence: float, plate_crop: Optional[np.ndarray], db: Session) -> Dict:
         now_dt = datetime.datetime.utcnow()
@@ -1400,25 +1450,37 @@ templates = Jinja2Templates(directory="templates")
 # =====================================================================
 @app.get("/", response_class=HTMLResponse)
 async def serve_index(request: Request):
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "local_ip": get_local_ip(),
-        "server_port": request.url.port or 8000
-    })
+    return templates.TemplateResponse(
+        request=request,
+        name="index.html",
+        context={
+            "request": request,
+            "local_ip": get_local_ip(),
+            "server_port": request.url.port or 8000
+        }
+    )
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def serve_dashboard(request: Request):
-    return templates.TemplateResponse("dashboard.html", {
-        "request": request,
-        "local_ip": get_local_ip(),
-        "server_port": request.url.port or 8000
-    })
+    return templates.TemplateResponse(
+        request=request,
+        name="dashboard.html",
+        context={
+            "request": request,
+            "local_ip": get_local_ip(),
+            "server_port": request.url.port or 8000
+        }
+    )
 
 @app.get("/login", response_class=HTMLResponse)
 async def serve_login(request: Request):
-    return templates.TemplateResponse("login.html", {
-        "request": request
-    })
+    return templates.TemplateResponse(
+        request=request,
+        name="login.html",
+        context={
+            "request": request
+        }
+    )
 
 @app.get("/api/rto/config")
 def get_rto_config(db: Session = Depends(get_db)):
@@ -1731,6 +1793,8 @@ async def websocket_stream_endpoint(websocket: WebSocket):
     last_fps_time = time.time()
     frame_count = 0
     fps = 0.0
+    # Fast 2-frame consensus per stream connection
+    consensus_tracker = PlateConsensus(min_count=2, max_age_seconds=5.0, min_confidence=0.50, min_share=0.51)
     
     try:
         while True:
@@ -1760,42 +1824,66 @@ async def websocket_stream_endpoint(websocket: WebSocket):
                 
             detections = perform_anpr(frame)
             
-            observed_valid_plate = None
-            for det in detections:
-                if det["is_valid"]:
-                    observed_valid_plate = det["plate_text"]
-                    break
-                    
-            gate_manager.add_observation(observed_valid_plate, observed_valid_plate is not None)
-            
-            consensus_info = gate_manager.get_consensus(min_count=2)
+            observed = next((det for det in detections if det["is_valid"]), None)
+            consensus_info = consensus_tracker.observe(
+                observed["normalized_plate"] if observed else None,
+                max(observed["confidence"], 0.92) if observed else 0.0,
+                observed is not None,
+            )
             gate_event = None
+
+            if consensus_info and observed:
+                bx = observed["box"]
+                plate_crop = frame[bx[1]:bx[1]+bx[3], bx[0]:bx[0]+bx[2]]
+                if plate_crop.size:
+                    gate_event = gate_manager.trigger_gate_event(
+                        observed["plate_text"], consensus_info.confidence, plate_crop, db
+                    )
             
-            if consensus_info:
-                consensus_plate, freq = consensus_info
-                plate_crop = None
-                conf = 0.96
-                for det in detections:
-                    if det["plate_text"] == consensus_plate or det["formatted_plate"] == consensus_plate:
-                        bx = det["box"]
-                        plate_crop = frame[bx[1]:bx[1]+bx[3], bx[0]:bx[0]+bx[2]]
-                        conf = det["confidence"]
-                        break
-                        
-                gate_event = gate_manager.trigger_gate_event(consensus_plate, conf, plate_crop, db)
+            # Real-time preview telemetry for currently observed plate
+            preview_telemetry = None
+            if observed and not gate_event:
+                cached_v = db.query(VehicleRegistry).filter(
+                    (VehicleRegistry.plate_number == observed["plate_text"]) |
+                    (VehicleRegistry.plate_number == observed["normalized_plate"])
+                ).first()
+                if cached_v:
+                    preview_telemetry = {
+                        "plate_number": cached_v.plate_number,
+                        "access_status": cached_v.access_status,
+                        "owner_name": cached_v.owner_name,
+                        "vehicle_model": cached_v.vehicle_model,
+                        "fuel_type": cached_v.fuel_type,
+                        "registration_city": cached_v.registration_city,
+                        "gate_action": "VERIFYING",
+                        "stay_duration": "In View"
+                    }
+                else:
+                    preview_telemetry = {
+                        "plate_number": observed["plate_text"],
+                        "access_status": "AUTHORIZED",
+                        "owner_name": "Scanning Vahan...",
+                        "vehicle_model": "Indian Motor Vehicle",
+                        "fuel_type": "PETROL / DIESEL",
+                        "registration_city": "RTO India",
+                        "gate_action": "VERIFYING",
+                        "stay_duration": "In View"
+                    }
                 
             payload = {
                 "fps": fps,
                 "detections": detections,
-                "consensus_plate": consensus_info[0] if consensus_info else None,
-                "consensus_count": consensus_info[1] if consensus_info else len([p for p in gate_manager.voting_buffer if p]),
+                "consensus_plate": observed["plate_text"] if observed else None,
+                "consensus_count": consensus_tracker.current_count,
+                "consensus_required": consensus_tracker.min_count,
+                "consensus_stable": consensus_info is not None,
                 "gate_state": {
                     "is_open": gate_manager.is_open,
                     "gate_angle": gate_manager.gate_angle,
                     "status_message": gate_manager.status_message
                 },
                 "gate_event": gate_event,
-                "last_telemetry": gate_manager.last_telemetry
+                "last_telemetry": gate_manager.last_telemetry or preview_telemetry
             }
             
             await websocket.send_json(payload)
